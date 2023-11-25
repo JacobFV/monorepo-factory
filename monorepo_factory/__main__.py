@@ -101,9 +101,7 @@ def create_or_update_repo(repos, repo, base_path):
     if "submodules" in repo:
         for subrepo_entry in repo.subrepos:
             suprepo_name = subrepo_entry.name
-            subrepo = next(
-                (r for r in repos if r.name == repo_name), None
-            )  # TODO: get by dict lookup
+            subrepo = next((r for r in repos if r.name == repo_name), None)
             if (
                 "branches" in repo
                 and "branches" in subrepo
@@ -138,24 +136,14 @@ def create_or_update_repo(repos, repo, base_path):
         sh(f"git checkout main", cwd=repo_path)
 
 
-def extract_subrepos(repos):
-    final_repos = []
-    for repo in repos:
-        if "subrepo" in repo:
+def extract_and_append_subrepos(repos):
+    for repo in repos[:]:
+        if "subrepos" in repo:
             for subrepo in repo.subrepos:
-                final_repos.append({"name": subrepo.name})
-        final_repos.append(repo)
-
-    repos, final_repos = final_repos, []
-
-    for repo in repos:
-        for final_repo in final_repos:
-            if final_repo.name == repo.name:
-                final_repo.update(repo)
-        else:
-            final_repos.append(repo)
-
-    return final_repos
+                if any(r.name == subrepo.name for r in repos):
+                    break
+                repos.append(Box({"name": subrepo.name}))
+    return repos
 
 
 @app.command()
@@ -164,14 +152,15 @@ def generate(file: str):
     base_path = os.path.dirname(file_path)
 
     data = Box.from_toml(filename=file)
-    repos = extract_subrepos(repos)
-    pattern_definitions = [repo for repo in data.repo if "pattern" in repo]
-    sorted_patterns = sort_patterns(pattern_definitions)
-    repos = [
-        apply_defaults_to_repo(repo, sorted_patterns)
-        for repo in data.repo
-        if "name" in repo
+    repos = [r for r in data.repo if "name" in r]
+    print([r.name for r in repos])
+    repos = extract_and_append_subrepos(repos)
+    print([r.name for r in repos])
+    pattern_definitions = [
+        pattern_repo for pattern_repo in data.repo if "pattern" in pattern_repo
     ]
+    sorted_patterns = sort_patterns(pattern_definitions)
+    repos = [apply_defaults_to_repo(repo, sorted_patterns) for repo in repos]
     graph = build_dependency_graph(repos)
 
     os.chdir(base_path)
@@ -181,11 +170,17 @@ def generate(file: str):
         if repo:
             create_or_update_repo(repos, repo, base_path)
 
+    for repo_name in nx.topological_sort(graph):
+        repo = next((r for r in repos if r.name == repo_name), None)
+        if repo and 'submodules' in repo:
+            ...
+        
+
     # Displaying the tree (optional, for visualization)
     tree = Tree("🌌 Repositories")
     for repo in repos:
         repo_node = tree.add(
-            f"[bold green]{repo.name}[/bold green]: {repo.description.strip()}"
+            f"[bold green]{repo.name}[/bold green]: {repo.description.strip() if 'description' in repo else ''}"
         )
         if "branches" in repo:
             branches_node = repo_node.add("[bold yellow]Branches[/bold yellow]")
