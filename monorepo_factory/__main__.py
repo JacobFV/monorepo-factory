@@ -1,188 +1,201 @@
-from pathlib import Path
-import subprocess
-from time import sleep
-import yaml
-import os
+import shutil
+from textwrap import dedent
+from typing import final
 import typer
 from rich.console import Console
-from typing import List, Dict, Optional
+from rich.tree import Tree
+from box import Box
+from subprocess import check_output, CalledProcessError
+import os
+import networkx as nx
+import fnmatch
 
-# Initialize Typer and Rich Console
-app = typer.Typer(
-    help="This application automates the creation and setup of GitHub repositories based on a YAML configuration file. It supports creating root repositories and their forks, with options to specify the organization and visibility (public/private)."
-)
+
+app = typer.Typer()
 console = Console()
 
 
-def run_command(
-    command: List[str], cwd: Optional[str] = None, capture_output: bool = False
-) -> Optional[str]:
-    """Run a shell command using subprocess."""
+def sh(cmd: str, cwd: str = None):
     try:
-        print(f'{cwd} $ {" ".join(command)}')
-        result = subprocess.check_output(command, cwd=cwd, text=True)
-        if capture_output:
-            return result.strip()
-        return None
-    except subprocess.CalledProcessError as e:
-        console.print(f"[red]Error executing {' '.join(command)}: {e.output}[/red]")
-        if capture_output:
-            return None
+        return check_output(cmd, shell=True, cwd=cwd, text=True)
+    except CalledProcessError as e:
+        console.print(f"An error occurred while executing the command: {cmd}")
+        console.print(f"Error details: {e.output}")
         raise
 
 
-def extract_org_repo(name: str) -> tuple[str, str]:
-    """Extract organization and repo name from the given string."""
-    parts = name.split("/")
-    if len(parts) == 2:
-        return parts[0], parts[1]
-    return "", parts[0]
+def sort_patterns(patterns):
+    # Sort patterns by their specificity (length in this case)
+    return sorted(patterns, key=lambda p: len(p["pattern"]), reverse=True)
 
 
-@app.command()
-def create_repos(
-    file_path: str = typer.Argument(
-        ..., help="Path to the YAML file with repo structure"
-    ),
-    default_visibility: str = typer.Option(
-        "public", help="Default visibility for repositories (public/private)"
-    ),
-    git_dir: str = typer.Option("", help="Directory to create git repositories in"),
-):
-    """Command to create repositories as per the YAML structure."""
-    base_dir = git_dir if git_dir else str(Path(file_path).parent)
+def apply_defaults_to_repo(repo, patterns):
+    for pattern in patterns:
+        if fnmatch.fnmatch(repo.name, pattern.get("pattern", "*")):
+            for key, value in pattern.items():
+                if key != "pattern":
+                    repo.setdefault(key, value)
+    return repo
 
-    try:
-        with open(file_path, "r") as file:
-            data = yaml.safe_load(file)
-            for repo_data in data:
-                process_repos(
-                    repo_data,
-                    default_visibility=default_visibility,
-                    base_dir=base_dir,
-                    create=True,
+
+def build_dependency_graph(repos):
+    graph = nx.DiGraph()
+
+    # Iterate through each repo and subrepo to build the graph
+    for repo in repos:
+        # Add each top-level repo as a node
+        graph.add_node(repo.name)
+
+        # If the repo has a clone source, add an edge from the clone source to the repo
+        # This indicates that the repo depends on its clone source
+        if "clone" in repo:
+            graph.add_edge(repo.clone, repo.name)
+
+        # Process subrepos if any
+        if "subrepos" in repo:
+            for subrepo in repo.subrepos:
+                # Add each subrepo as a node
+                graph.add_node(subrepo.name)
+
+                # If the subrepo has a clone source, add an edge from the clone source to the subrepo
+                # This ensures the subrepo is created before being added as a submodule
+                if "clone" in subrepo:
+                    graph.add_edge(subrepo.clone, subrepo.name)
+
+                # Create a dependency from the parent repo to its subrepo
+                # This ensures that the subrepos are processed before its parent
+                graph.add_edge(subrepo.name, repo.name)
+
+    return graph
+
+
+def create_or_update_repo(repos, repo, base_path):
+    org_name = None
+    match repo.name.split("/"):
+        case [org_name, repo_name]:
+            org_path = os.path.join(base_path, org_name)
+            repo_path = os.path.join(org_path, repo_name)
+            if not os.path.exists(org_path):
+                os.makedirs(org_path, exist_ok=True)
+        case [repo_name]:
+            repo_path = os.path.join(base_path, repo_name)
+        case _:
+            raise ValueError(f"Invalid repository name: {repo.name}")
+
+    if os.path.exists(repo_path):
+        shutil.rmtree(repo_path)
+
+    if "clone" in repo:
+        sh(f"git clone {repo.clone} {repo_path}")
+    else:
+        os.makedirs(repo_path, exist_ok=True)
+        sh(f"git init", cwd=repo_path)
+    with open(os.path.join(repo_path, "README.md"), "w") as readme:
+        readme.write(f"# {repo.name}")
+        if "description" in repo:
+            readme.write(f"\n\n{repo.description}")
+    sh(f"git add .", cwd=repo_path)
+    sh(f"git commit -m 'initial commit'", cwd=repo_path)
+
+    currently_created_branches = set()
+    if "submodules" in repo:
+        for subrepo_entry in repo.subrepos:
+            suprepo_name = subrepo_entry.name
+            subrepo = next(
+                (r for r in repos if r.name == repo_name), None
+            )  # TODO: get by dict lookup
+            if (
+                "branches" in repo
+                and "branches" in subrepo
+                and repo.branches
+                and subrepo.branches
+            ):
+                # add submodule for each branch that matches
+                for branch in repo.branches:
+                    sh(f"git checkout -b {branch}", cwd=repo_path)
+            else:
+                # just use the subrepo default branch
+                match subrepo.name.split("/"):
+                    case [org_name, subrepo_dirname]:
+                        relative_subrepo_path = f"../{subrepo_dirname}"
+                    case [subrepo_org_name, subrepo_dirname]:
+                        relative_subrepo_path = (
+                            f"../../{subrepo_org_name}/{subrepo_dirname}"
+                        )
+                    case [subrepo_dirname]:
+                        relative_subrepo_path = f"../{subrepo_dirname}"
+                    case _:
+                        raise Exception(f"Invalid format: {subrepo.name}")
+
+                sh(
+                    f"git submodule add {relative_subrepo_path}.git {subrepo.path}",
+                    cwd=repo_path,
                 )
-    except FileNotFoundError:
-        console.print(f"[red]File not found: {file_path}[/red]")
-    except yaml.YAMLError as e:
-        console.print(f"[red]Error parsing YAML: {e}[/red]")
+
+    if "branches" in repo:
+        for branch in set(repo.branches) - currently_created_branches:
+            sh(f"git checkout -b {branch}", cwd=repo_path)
+        sh(f"git checkout main", cwd=repo_path)
+
+
+def extract_subrepos(repos):
+    final_repos = []
+    for repo in repos:
+        if "subrepo" in repo:
+            for subrepo in repo.subrepos:
+                final_repos.append({"name": subrepo.name})
+        final_repos.append(repo)
+
+    repos, final_repos = final_repos, []
+
+    for repo in repos:
+        for final_repo in final_repos:
+            if final_repo.name == repo.name:
+                final_repo.update(repo)
+        else:
+            final_repos.append(repo)
+
+    return final_repos
 
 
 @app.command()
-def check_repos(
-    file_path: str = typer.Argument(
-        ..., help="Path to the YAML file with repo structure"
-    )
-):
-    """Command to check the existence of repositories as per the YAML structure."""
-    try:
-        with open(file_path, "r") as file:
-            data = yaml.safe_load(file)
-            for repo_data in data:
-                process_repos(repo_data, create=False)
-    except FileNotFoundError:
-        console.print(f"[red]File not found: {file_path}[/red]")
-    except yaml.YAMLError as e:
-        console.print(f"[red]Error parsing YAML: {e}[/red]")
+def generate(file: str):
+    file_path = os.path.abspath(file)
+    base_path = os.path.dirname(file_path)
 
+    data = Box.from_toml(filename=file)
+    repos = extract_subrepos(repos)
+    pattern_definitions = [repo for repo in data.repo if "pattern" in repo]
+    sorted_patterns = sort_patterns(pattern_definitions)
+    repos = [
+        apply_defaults_to_repo(repo, sorted_patterns)
+        for repo in data.repo
+        if "name" in repo
+    ]
+    graph = build_dependency_graph(repos)
 
-@app.command()
-def mock_repos(
-    file_path: str = typer.Argument(
-        ..., help="Path to the YAML file with repo structure"
-    ),
-    git_dir: str = typer.Option("", help="Directory to create git repositories in"),
-):
-    """Command to mock create the repositories as per the YAML structure."""
-    git_dir = git_dir or Path(file_path).parent
-    git_dir = Path(git_dir)
+    os.chdir(base_path)
 
-    try:
-        with open(file_path, "r") as yml_config:
-            data = yaml.safe_load(yml_config)
-    except FileNotFoundError:
-        console.print(f"[red]File not found: {file_path}[/red]")
-        typer.Exit(1)
-    except yaml.YAMLError as e:
-        console.print(f"[red]Error parsing YAML: {e}[/red]")
-        typer.Exit(1)
+    for repo_name in nx.topological_sort(graph):
+        repo = next((r for r in repos if r.name == repo_name), None)
+        if repo:
+            create_or_update_repo(repos, repo, base_path)
 
-    create_mock_repos(git_dir, data)
-    typer.Exit(0)
-
-def create_mock_repos(git_dir, data):
-    for repo_data in data:
-        _, name = extract_org_repo(repo_data["name"])
-        run_command(["mkdir", "-p", str(git_dir / repo_data['name'])], cwd=".")
-        with open(git_dir / repo_data["name"] / "README.md", "w") as f:
-            f.write(f"# {name}\n")
-        if "forks" in repo_data:
-            create_mock_repos(git_dir, repo_data["forks"])
-
-
-def process_repos(
-    repo_data: Dict,
-    parent: Optional[str] = None,
-    default_visibility: str = "public",
-    base_dir: str = "",
-    create: bool = True,
-) -> None:
-    """Process each repo and its forks recursively for creation or checking existence."""
-    full_name = repo_data["name"]
-    org, repo_name = extract_org_repo(full_name)
-
-    if create:
-        create_repo(org, repo_name, default_visibility, base_dir)
-    else:
-        check_repo_existence(org, repo_name)
-
-    # Process forks if they exist
-    for fork in repo_data.get("forks", []):
-        process_repos(fork, full_name, default_visibility, base_dir, create)
-
-
-def create_repo(org: str, repo_name: str, visibility: str, base_dir: str) -> None:
-    """Create local and remote repo, and push it to GitHub."""
-    repo_path = os.path.join(base_dir, repo_name)
-
-    # Create local repo
-    os.makedirs(repo_path, exist_ok=True)
-    run_command(["git", "init"], cwd=repo_path)
-
-    # Create README and make initial commit
-    readme_path = os.path.join(repo_path, "README.md")
-    with open(readme_path, "w") as file:
-        file.write(f"# {repo_name}")
-    sleep(0.1)
-    run_command(["git", "add", readme_path], cwd=repo_path)
-    run_command(["git", "commit", "-m", "Initial commit"], cwd=repo_path)
-
-    # Create remote repo and push
-    remote_url = f"{org}/{repo_name}" if org else repo_name
-    visibility_flag = "--public" if visibility == "public" else "--private"
-    run_command(
-        [
-            "gh",
-            "repo",
-            "create",
-            remote_url,
-            visibility_flag,
-            "--source=.",
-            "--remote=upstream",
-            "--push",
-        ],
-        cwd=repo_path,
-    )
-
-
-def check_repo_existence(org: str, repo_name: str) -> None:
-    """Check if a repository exists."""
-    repo_full_name = f"{org}/{repo_name}" if org else repo_name
-    result = run_command(["gh", "repo", "view", repo_full_name], capture_output=True)
-    if result:
-        console.print(f"[green]Repository exists: {repo_full_name}[/green]")
-    else:
-        console.print(f"[yellow]Repository does not exist: {repo_full_name}[/yellow]")
+    # Displaying the tree (optional, for visualization)
+    tree = Tree("🌌 Repositories")
+    for repo in repos:
+        repo_node = tree.add(
+            f"[bold green]{repo.name}[/bold green]: {repo.description.strip()}"
+        )
+        if "branches" in repo:
+            branches_node = repo_node.add("[bold yellow]Branches[/bold yellow]")
+            for branch in repo.branches:
+                branches_node.add(branch)
+        if "subrepos" in repo:
+            subrepos_node = repo_node.add("[bold blue]Subrepos[/bold blue]")
+            for subrepo in repo.subrepos:
+                subrepos_node.add(f"{subrepo.path} - {subrepo.name}")
+    console.print(tree)
 
 
 if __name__ == "__main__":
