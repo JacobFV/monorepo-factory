@@ -15,7 +15,6 @@ from rich.console import Console
 console = Console()
 
 
-
 @contextmanager
 def cwd(path):
     """Context manager for changing the current working directory."""
@@ -88,12 +87,14 @@ def prep_repos(repos: Box[str, dict], patterns: Box[str, dict]):
         repo_data_overrides = matching_patterns_by_priority + [repos[repo_name]]
         repos[repo_name] = reduce(lambda x, y: {**x, **y}, repo_data_overrides)
 
+
 def initialize_repo(repo):
     # Initialize with README
     with open("README.md", "w") as file:
         file.write(f"# {repo.name}\n\n{repo.get('description', None)}")
     sh(f"git add .")
     sh(f'git commit -m "Initial commit"')
+
 
 def build_clone_graph(repos: Dict[str, dict]) -> nx.DiGraph:
     """Build a graph representing the creation order of repositories."""
@@ -103,6 +104,7 @@ def build_clone_graph(repos: Dict[str, dict]) -> nx.DiGraph:
         if "clone" in repo:
             graph.add_edge(repo.clone, repo.name)
     return graph
+
 
 def create_repo(repo):
     """Create a new repository."""
@@ -116,9 +118,7 @@ def clone_repo(repo, clone):
     """Clone a repository from a source."""
     with cwd(repo.path.parent):
         clone_relpath = repo.path_to_root_from_outside / clone.path
-        sh(
-            f"git clone {clone_relpath} {repo.path.name}"
-        )
+        sh(f"git clone {clone_relpath} {repo.path.name}")
         with cwd(repo.path.name):
             initialize_repo(repo)
 
@@ -129,7 +129,7 @@ def create_or_clone_repos(repos: Dict[str, dict]):
     for repo_name in nx.topological_sort(clone_graph):
         repo = repos[repo_name]
 
-        if 'clone' in repo:
+        if "clone" in repo:
             clone_repo(repo, repos[repo.clone])
         else:
             create_repo(repo)
@@ -149,11 +149,17 @@ def setup_submodules(repos: Dict[str, dict]):
     submodule_graph = build_submodule_graph(repos)
     for repo_name in nx.topological_sort(submodule_graph):
         repo = repos[repo_name]
-        if 'subrepos' in repo and repo.subrepos:
+        if "subrepos" in repo and repo.subrepos:
             with cwd(repo.path):
                 for subrepo_name in submodule_graph.successors(repo.name):
-                    subrepo_in_repo = next(subrepo for subrepo in repo.subrepos if subrepo.name == subrepo_name)
-                    sh(f"git submodule add {repo.path_to_root_from_inside / repos[subrepo_name].path} {subrepo_in_repo.path}")
+                    subrepo_in_repo = next(
+                        subrepo
+                        for subrepo in repo.subrepos
+                        if subrepo.name == subrepo_name
+                    )
+                    sh(
+                        f"git submodule add {repo.path_to_root_from_inside / repos[subrepo_name].path} {subrepo_in_repo.path}"
+                    )
 
                 sh("git add .")
                 sh('git commit -m "Added submodules"')
