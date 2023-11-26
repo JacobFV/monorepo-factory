@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "monorepo-factory"
-version = "0.1.0"
+version = "1.0.0"
 description = ""
 authors = ["Jacob Valdez <jacobfv123@gmail.com>"]
 readme = "README.md"
